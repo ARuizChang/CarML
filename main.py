@@ -4,7 +4,8 @@ from pygame.math import Vector2
 import neat
 import os
 import pickle
-
+import argparse
+import copy
 
 WIDTH, HEIGHT = 1024, 720
 FPS = 60
@@ -27,7 +28,6 @@ pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
-
 
 track_segments = []
 
@@ -93,7 +93,6 @@ def cast_ray(origin, direction, segments, max_length):
                 nearest_t, nearest_point = t, point
     return nearest_t, nearest_point
 
-
 class Car:
     def __init__(self, pos):
         self.pos = Vector2(pos)
@@ -101,6 +100,7 @@ class Car:
         self.velocity = 0.0
         self.current_checkpoint = 0
         self.last_pos = Vector2(pos)
+        self.passed_checkpoints = set()  # Track passed checkpoints in this lap
 
     def update(self, dt, accel_input, steer_input, handbrake=False):
         self.last_pos = Vector2(self.pos)
@@ -150,19 +150,35 @@ def update_checkpoint_progress(car):
         return True
     return False
 
-def calculate_reward(car, ray_distances, time_step_penalty=-0.01):
+def calculate_reward(car, ray_distances, time_step_penalty=-0.05):
     filtered_dists = [d for d in ray_distances if d is not None]
     min_dist = min(filtered_dists) if filtered_dists else RAY_LENGTH
 
     if min_dist < 10:
-        return -1.0
+        return -10.0  # Strong collision penalty
 
     passed_checkpoint = update_checkpoint_progress(car)
-    reward_checkpoint = 1.0 if passed_checkpoint else 0.0
-    reward_velocity = max(car.velocity / MAX_SPEED, 0)
+    reward_checkpoint = 0.0
+    reward_finish = 0.0
+
+    # Only reward for new checkpoints
+    if passed_checkpoint:
+        if car.current_checkpoint not in car.passed_checkpoints:
+            car.passed_checkpoints.add(car.current_checkpoint)
+            reward_checkpoint = 10.0
+
+        # If all checkpoints passed, give big bonus and reset for next lap
+        if len(car.passed_checkpoints) == len(checkpoints):
+            reward_finish = 100.0
+            car.passed_checkpoints.clear()
+
+    reward_velocity = max(car.velocity / MAX_SPEED, 0.0) * 0.5
     reward_time = time_step_penalty
 
-    reward = 2.0 * reward_checkpoint + 0.3 * reward_velocity + reward_time
+    # Penalize for going backwards
+    backward_penalty = -2.0 if car.velocity < -5 else 0.0
+
+    reward = reward_checkpoint + reward_finish + reward_velocity + reward_time + backward_penalty
     return reward
 
 def normalize_ray_distances(ray_distances):
@@ -194,7 +210,6 @@ def draw_hud(surface, distances, velocity, angle_deg, reward, checkpoint_idx):
     surface.blit(hud_surface, (hud_x, hud_y))
     for i, text in enumerate(lines):
         surface.blit(font.render(text, True, HUD_TEXT), (hud_x + 8, hud_y + 8 + i * 22))
-
 
 def eval_genomes(genomes, config):
     nets = []
@@ -255,7 +270,6 @@ def eval_genomes(genomes, config):
             nets.pop(i)
             ge.pop(i)
 
-
         if len(cars) > 0:
             screen.fill(BG)
             for a, b in track_segments:
@@ -293,8 +307,7 @@ def car_polygon(pos, heading):
     rotated = [Vector2(c.x * cos_a - c.y * sin_a, c.x * sin_a + c.y * cos_a) + pos for c in corners]
     return rotated
 
-
-def run_neat(config_file):
+def run_neat(config_file, restore_agent=None, generations=20):
     config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
                          neat.DefaultSpeciesSet, neat.DefaultStagnation,
                          config_file)
@@ -303,15 +316,138 @@ def run_neat(config_file):
     stats = neat.StatisticsReporter()
     p.add_reporter(stats)
 
-    winner = p.run(eval_genomes, 20)
+    # If restoring from agent, set all population to a deep copy of that genome with correct keys and fitness
+    if restore_agent is not None:
+        with open(restore_agent, "rb") as f:
+            winner = pickle.load(f)
+        for gid in p.population:
+            g = copy.deepcopy(winner)
+            g.key = gid
+            g.fitness = 0.0  # Ensure fitness is set!
+            p.population[gid] = g
+        # Re-speciate the population after restoring
+        p.species.speciate(config, p.population, p.generation)
 
+    winner = p.run(eval_genomes, generations)
 
     with open("best_car.pkl", "wb") as f:
         pickle.dump(winner, f)
     print("Best genome saved as best_car.pkl")
 
+def play_human():
+    car = Car((100, 400))
+    car.heading = 270
+    run = True
+    while run:
+        dt = clock.tick(FPS) / 1000.0
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return
+
+        keys = pygame.key.get_pressed()
+        accel = 0
+        steer = 0
+        handbrake = False
+        if keys[pygame.K_UP]:
+            accel = 1
+        elif keys[pygame.K_DOWN]:
+            accel = -1
+        if keys[pygame.K_LEFT]:
+            steer = -1
+        elif keys[pygame.K_RIGHT]:
+            steer = 1
+        if keys[pygame.K_SPACE]:
+            handbrake = True
+
+        car.update(dt, accel, steer, handbrake)
+        ray_data = []
+        for dir_vec, length in car.rays(8, RAY_LENGTH):
+            dist, _ = cast_ray(car.pos, dir_vec, track_segments, RAY_LENGTH)
+            ray_data.append(dist)
+
+        screen.fill(BG)
+        for a, b in track_segments:
+            pygame.draw.line(screen, TRACK_COLOR, a, b, 4)
+        for i_cp, (start, end) in enumerate(checkpoints):
+            color = (0, 255, 0) if i_cp == car.current_checkpoint else (150, 150, 150)
+            pygame.draw.line(screen, color, start, end, 2)
+        pygame.draw.polygon(screen, CAR_COLOR, car_polygon(car.pos, car.heading))
+        for dir_vec, length in car.rays(8, RAY_LENGTH):
+            dist, point = cast_ray(car.pos, dir_vec, track_segments, RAY_LENGTH)
+            end_point = point if point is not None else car.pos + dir_vec * length
+            pygame.draw.line(screen, RAY_COLOR, car.pos, end_point, 1)
+            if point:
+                pygame.draw.circle(screen, (255, 0, 0), (int(point.x), int(point.y)), 4)
+        reward_display = calculate_reward(car, ray_data)
+        draw_hud(screen, ray_data, car.velocity, car.heading, reward_display, car.current_checkpoint)
+        pygame.display.flip()
+
+def view_agent(pkl_file, config_file):
+    with open(pkl_file, "rb") as f:
+        genome = pickle.load(f)
+    config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
+                         neat.DefaultSpeciesSet, neat.DefaultStagnation,
+                         config_file)
+    net = neat.nn.FeedForwardNetwork.create(genome, config)
+    car = Car((100, 400))
+    car.heading = 270
+    run = True
+    while run:
+        dt = clock.tick(FPS) / 1000.0
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return
+
+        ray_data = []
+        for dir_vec, length in car.rays(8, RAY_LENGTH):
+            dist, _ = cast_ray(car.pos, dir_vec, track_segments, RAY_LENGTH)
+            ray_data.append(dist)
+        inputs = normalize_ray_distances(ray_data)
+        norm_velocity = (car.velocity + MAX_SPEED * 0.5) / (MAX_SPEED * 1.5)
+        norm_heading = car.heading / 360.0
+        inputs.append(norm_velocity)
+        inputs.append(norm_heading)
+        output = net.activate(inputs)
+        accel_input = (output[0] * 2) - 1
+        steer_input = (output[1] * 2) - 1
+        handbrake = output[2] > 0.5
+        car.update(dt, accel_input, steer_input, handbrake)
+
+        screen.fill(BG)
+        for a, b in track_segments:
+            pygame.draw.line(screen, TRACK_COLOR, a, b, 4)
+        for i_cp, (start, end) in enumerate(checkpoints):
+            color = (0, 255, 0) if i_cp == car.current_checkpoint else (150, 150, 150)
+            pygame.draw.line(screen, color, start, end, 2)
+        pygame.draw.polygon(screen, CAR_COLOR, car_polygon(car.pos, car.heading))
+        for dir_vec, length in car.rays(8, RAY_LENGTH):
+            dist, point = cast_ray(car.pos, dir_vec, track_segments, RAY_LENGTH)
+            end_point = point if point is not None else car.pos + dir_vec * length
+            pygame.draw.line(screen, RAY_COLOR, car.pos, end_point, 1)
+            if point:
+                pygame.draw.circle(screen, (255, 0, 0), (int(point.x), int(point.y)), 4)
+        reward_display = calculate_reward(car, ray_data)
+        draw_hud(screen, ray_data, car.velocity, car.heading, reward_display, car.current_checkpoint)
+        pygame.display.flip()
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["train", "view", "play"], default="train", help="Mode: train, view, play")
+    parser.add_argument("--agent", type=str, help="Path to .pkl agent file (for view or resume training)")
+    parser.add_argument("--generations", type=int, default=20, help="Number of generations to train")
+    args = parser.parse_args()
+
     local_dir = os.path.dirname(__file__)
     config_path = os.path.join(local_dir, "config-feedforward.txt")
 
-    run_neat(config_path)
+    if args.mode == "train":
+        run_neat(config_path, restore_agent=args.agent, generations=args.generations)
+    elif args.mode == "view":
+        if not args.agent:
+            print("Please provide --agent path to .pkl file.")
+        else:
+            view_agent(args.agent, config_path)
+    elif args.mode == "play":
+        play_human()
